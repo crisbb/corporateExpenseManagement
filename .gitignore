@@ -1,0 +1,28 @@
+# ====== Python 项目标准忽略 ======
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 编译产物
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# IDE 配置
+.idea/
+.vscode/
+*.sublime-workspace
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log

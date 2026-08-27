@@ -1,0 +1,19 @@
+name: 📅 每日学习进度提醒
+on:
+  schedule:
+    - cron: '0 18 * * *' 
+  workflow_dispatch:
+jobs:
+  daily-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📩 发送进度提醒
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 1,
+              body: "**每日进度提醒**\\n\\n📌 请完成 Day 1 学习任务\\n🚀 提交PR：https://github.com/crisbb/corporateExpenseManagement/compare/main...fix/day1"
+            });
