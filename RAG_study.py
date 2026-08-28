@@ -145,7 +145,9 @@ if __name__ == '__main__':
     # 在线阶段：处理用户查询
     user_query = "报销款多久能到账？"
     print(f"\n❓ 用户问题: {user_query}")
-    print(f"💡 AI回答: {generate_rag_response(user_query)}")
+    response_text = generate_rag_response(user_query)
+
+    print(f"💡 AI回答: {response_text}")
     
 # 模拟面试题：“如何设计报销政策 RAG 系统？”
 # 超出预期的回答框架：
