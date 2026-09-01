@@ -1,19 +1,93 @@
 # RAG 系统实现（基于阿里云百炼 + Chroma）
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+from dataclasses import dataclass, field
+from langchain_community.document_loaders import TextLoader # 文本加载器
+from langchain_text_splitters import RecursiveCharacterTextSplitter #智能分块器
+from chromadb import EphemeralClient # 内存版ChromaDB(重启丢失)
+from collections import Counter # 词频计数器
+from fastapi.responses import StreamingResponse
+
+"""
+多轮对话 RAG 关键：                                 │
+│                                                     │
+│  1. 检索用"改写后的独立问题"（消除指代）              │
+│  2. 生成用"原始问题 + 历史"（让 LLM 理解语境）       │
+│  3. 滑动窗口限制历史长度（避免 Prompt 过长）          │
+│                                                     │
+│  为什么检索和生成用不同的信息？                       │
+│  检索 → 需要精准关键词 → 用改写后的完整问题          │
+│  生成 → 需要理解语境 → 用原始问题 + 历史对话 
+"""
+
+@dataclass
+class ChatMessage:
+    role: str
+    content: str
+class ConversationMemory:
+    def __init__(self, max_turns: int = 3):
+        self.messages: list[ChatMessage] = []
+        self.max_turns = max_turns
+
+    def add_message(self, role: str, content: str):
+        self.messages.append(ChatMessage(role, content))
+        while len(self.messages) > self.max_turns:
+            self.messages.pop(0)
+    def get_messages(self) -> str:
+        lines = []
+        for msg in self.messages:
+            prefix = "用户" if msg.role == "user" else "AI"
+            lines.append(f"{prefix}: {msg.content}")
+        return "\n".join(lines)
+    def clear(self):
+        self.messages.clear()
+
+
+def rewrite_with_context(query: str, history: str) -> str:
+    """
+    结合对话历史，将用户的后续问题改写为独立完整的问题。
+
+    例：
+        历史: 用户: 报销怎么打款？ AI: 3个工作日...
+        当前: 那请假呢？
+        改写: 请假的审批流程是什么？
+    """
+    prompt = f"""根据对话历史，将用户的最新问题改写为一个独立、完整、可检索的问题。
+要求：
+- 消除指代词（"那个""它""上面的"等）
+- 补充上下文中的隐含信息
+- 只输出改写后的问题，不要解释
+
+对话历史：
+{history}
+
+用户最新问题：{query}
+
+改写后的独立问题："""
+
+    resp = httpx.post(
+        f"{LLM_BASE_URL}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "qwen-turbo",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
 
 # 【离线阶段】（只做一次）
 #   文档 → 加载 → 分块 → 向量化 → 存入向量数据库
 
 # 【在线阶段】（每次提问）
 #   用户提问 → 向量化 → 在向量数据库中检索相似片段 → 塞进 prompt → 模型回答
-from langchain_community.document_loaders import TextLoader # 文本加载器
-from langchain_text_splitters import RecursiveCharacterTextSplitter #智能分块器
-from chromadb import EphemeralClient # 内存版ChromaDB(重启丢失)
-from langchain_core.prompts import ChatPromptTemplate #提示词模板
-from langchain_openai import ChatOpenAI # LangChain OpenAI 接口
-from langchain_core.output_parsers import StrOutputParser # 输出解析器
-from collections import Counter # 词频计数器
+
 
 import httpx # 异步 HTTP 客户
 import math # 数学函数（用于 BM25 公式）
@@ -75,7 +149,7 @@ class SimpleBM25:
         return ranked[:top_k]
     
 
-# ============ 加载文档 + 分块============ 
+# ============ 加载文档 + 分块============
 loader = TextLoader('knowledge_50.txt', encoding='utf-8')
 documents = loader.load()
 print(f"加载了 {len(documents)} 个文档")
@@ -160,7 +234,7 @@ def rerank_with_llm(query: str, documents: list[str], top_k: int = 2) -> list[st
     """
     # 把文档编号，让 LLM 只返回排序
     numbered_docs = "\n".join(f"[{i}] {doc}" for i, doc in enumerate(documents))
-    
+
     prompt = f"""以下是用户问题和若干候选文档（已编号）。请判断每个文档与问题的相关性，按相关性从高到低排序。
     只输出编号列表，如：0, 2, 1, 3, 4
 
@@ -191,7 +265,7 @@ def rerank_with_llm(query: str, documents: list[str], top_k: int = 2) -> list[st
 
     # 解析 "0, 2, 1" 这样的输出
     indices = [int(x.strip()) for x in result_text.split(",") if x.strip().isdigit()]
-    
+
     print(f"  [Rerank] 候选 {len(documents)} 条 → 排序: {indices} → 取 top-{top_k}")
     for i in indices[:top_k]:
         print(f"    #{i} | {documents[i][:40]}...")
@@ -208,12 +282,12 @@ def rrf_fusion(rank_lists: list[list[int]], k:int=60,top_k:int=3):
 
     """
         Reciprocal Rank Fusion 融合多路检索结果
-        
+
         参数：
             rank_lists: 多路检索结果的文档索引列表，如 [[0,3,1,4,2], [2,0,4,1,3]]
             k: 平滑参数（通常 60）
             top_k: 最终返回几条
-        
+
         返回：
             融合后的文档索引列表
         """
@@ -304,158 +378,131 @@ def hyde(query: str) -> str:
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"].strip()
 
-def hybrid_search_with_rewrite(collection, query: str,strategy: str = "rewrite", n_results: int=3,recall_n:int=5)->list[str]:
+def rag_chat_stream(collection, query: str, memory: ConversationMemory)->str:
     """
-    带 Query 改写的混合检索
-
-    strategy:
-        "none":     不改写
-        "rewrite":  简单改写
-        "expand":   问题扩展
-        "hyde":     假设性文档
-    混合检索：向量 + 关键词 → RRF 融合
-    query → 向量检索 → 文档ID列表
-    query → BM25 → 文档ID列表
-    两个ID列表 → RRF融合 → 最终文档内容
-    参数：
-        collection: ChromaDB collection
-        query: 用户问题
-        n_results: 最终返回几条
-        recall_n: 每路召回几条
-    """
-    # 向量检索
-    # ===== 1. Query 改写 =====
-    search_queries = [query]
-
-    if strategy == "rewrite":
-        rewritten = rewrite_query(query)
+        多轮对话 RAG：
+        1. 结合历史改写问题
+        2. 混合检索
+        3. 调 LLM 回答（带上历史上下文）
+        4. 存入记忆
+        """
+    # 1. 改写（如果有历史）
+    if memory.messages:
+        history = memory.get_messages()
+        rewritten = rewrite_with_context(query, history)
         print(f"  [改写] '{query}' → '{rewritten}'")
-        search_queries = [rewritten]
-
-    elif strategy == "expand":
-        subs = expand_query(query, n=3)
-        print(f"  [扩展] '{query}' → {subs}")
-        search_queries = subs
-
-    elif strategy == "hyde":
-        hypothetical = hyde(query)
-        print(f"  [HyDE] 假设文档: {hypothetical[:60]}...")
-        # HyDE 只用向量检索（假设文档本身没有关键词意义）
-        query_vec = get_embeddings([hypothetical])[0]
-        results = collection.query(query_embeddings=[query_vec], n_results=recall_n)
-        return results["documents"][0][:n_results]
+    else:
+        rewritten = query
+        print(f"  [改写] 首轮对话，无需改写")
 
     # ===== 2. 混合检索（对每个 search_query 分别检索）=====
+    # 2. 检索
     all_data = collection.get(include=["documents", "metadatas"])
     all_docs = all_data["documents"]
-    all_rank_lists = []
-    for sq in search_queries:
-        # 向量
-        vec = get_embeddings([sq])[0]
-        v_results = collection.query(query_embeddings=[vec], n_results=recall_n)
-        v_ids = [meta['index'] for meta in v_results['metadatas'][0]]
-        # 关键词
-        bm25 = SimpleBM25(all_docs)
-        k_ids = bm25.search(sq, top_k=recall_n)
 
-        all_rank_lists.append(v_ids)
-        all_rank_lists.append(k_ids)
-        print(f"  [关键词检索] '{sq}' → {k_ids}")
+    # 向量
+    query_vec = get_embeddings([rewritten])[0]
+    v_results = collection.query(query_embeddings=[query_vec], n_results=5)
+    v_ids = [meta["index"] for meta in v_results["metadatas"][0]]
 
-    # 3. RRF 融合
-    fused_ids = rrf_fusion(
-        rank_lists=all_rank_lists,
-        k=60,
-        top_k=n_results,
+    # 关键词
+    bm25 = SimpleBM25(all_docs)
+    k_ids = bm25.search(rewritten, top_k=5)
+
+    # RRF
+    fused_ids = rrf_fusion(rank_lists=[v_ids, k_ids], k=60, top_k=2)
+    context_docs = [all_docs[i] for i in fused_ids]
+    context = "\n\n".join(context_docs)
+    print(f"  [检索] top-2={fused_ids}")
+
+
+    # 3. 调 LLM（带上历史）
+    history_for_llm = memory.get_messages() if memory.messages else "（无）"
+    system_prompt = (
+        "你是一个专业HR助手，严格基于公司文档回答用户问题。\n"
+        "如果文档未提及，回答'根据公司现有资料无法确定'。\n"
+        "回答要简洁，不要编造信息。"
     )
-    print(f"  [RRF] 最终 top-{n_results}={fused_ids}")
 
-    # 4. 返回文档内容
-    return [all_docs[i] for i in fused_ids]
+    user_prompt = f"""【对话历史】
+    {history_for_llm}
+
+    【公司文档】
+    {context}
+
+    【用户问题】
+    {query}"""
+
+    resp = httpx.post(
+        f"{LLM_BASE_URL}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "qwen-plus",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.1,
+            "stream": True
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    # 逐行解析 SSE
+    # 逐行解析 SSE
+    full_answer = ""
+    for line in resp.iter_lines():
+        if not line:
+            continue
+        if line.startswith("data: "):
+            data_str = line[6:]
+            if data_str.strip() == "[DONE]":
+                break
+            import json
+            data = json.loads(data_str)
+            delta = data["choices"][0]["delta"].get("content", "")
+            if delta:
+                full_answer += delta
+                yield delta
+    # 4. 存入记忆
+    memory.add_message("user", query)
+    memory.add_message("assistant", full_answer)
 
 
+# class QuestionRequest:
+#     pass
+#
+#
+# @app.post("ask/stream")
+# def ask_stream(req: QuestionRequest):
+#     pass
 if __name__ == '__main__':
     print(f"\n向量库已加载（{collection.count()} 条记录）")
 
+    memory = ConversationMemory(max_turns=3)
+
     test_questions = [
-        ("RabbitMQ 用在什么场景？", "精确关键词"),
-        ("咋报销", "口语化"),
-        ("请假和报销的流程分别是什么？", "复合问题"),
-        ("后端框架是什么？", "简单语义"),
+        "报销怎么打款？",
+        "那请假呢？",
+        "后端用什么框架？",
     ]
 
-    strategies = ["none", "rewrite", "expand", "hyde"]
-
-    for q, tag in test_questions:
+    for q in test_questions:
         print(f"\n{'='*55}")
-        print(f"❓ {q}  [{tag}]")
+        print(f"❓ {q}")
         print(f"{'='*55}")
 
-        for s in strategies:
-            print(f"\n  【{s.upper()}】")
-            try:
-                docs = hybrid_search_with_rewrite(collection, q, strategy=s, n_results=2)
-                # 只看检索结果，不调 LLM（省 token）
-                for i, doc in enumerate(docs):
-                    print(f"    #{i+1}: {doc[:50]}...")
-            except Exception as e:
-                print(f"    ❌ {e}")
+        # 流式输出：逐字打印
+        print("💡 ", end="", flush=True)
+        for token in rag_chat_stream(collection, q, memory):
+            print(token, end="", flush=True)
+        print()  # 换行
 
-
-# 实际生产策略
-# 口语化特征词
-COLLOQUIAL_PATTERNS = [
-    # 疑问词
-    r"咋", r"啥", r"咋整", r"咋办", r"咋搞", r"咋弄",
-    r"搞啥", r"弄啥", r"整啥",
-    # 口语动词
-    r"怎么弄", r"怎么搞", r"怎么整", r"怎么弄",
-    r"搞一下", r"弄一下", r"整一下",
-    # 口语语气
-    r"那个", r"这个那个", r"就是说",
-    r"帮我看看", r"帮我看下",
-    # 省略主语/对象
-    r"^多少$", r"^什么时候$", r"^找谁",
-]
-
-
-def is_colloquial(query: str) -> bool:
-    """
-    检测用户问题是否为口语化表达
-
-    返回 True → 需要改写
-    返回 False → 直接检索
-    """
-    for pattern in COLLOQUIAL_PATTERNS:
-        if re.search(pattern, query):
-            return True
-    return False
-# 根据问题复杂度选择策略
-"""
-规则覆盖不了的场景（比如"年假能带明年吗"），生产环境可以加一层 LLM 判断兜底
-"""
-def choose_strategy(query: str) -> str:
-    """根据问题特征选择检索策略"""
-    # 复合问题
-    if len(query) > 15 and any(kw in query for kw in ["和", "分别", "以及", "还有"]):
-        return "expand"
-    # 口语化
-    if is_colloquial(query):
-        return "rewrite"
-    # 默认
-    return "none"
-
-tests = [
-    "咋报销",              # True
-    "报销怎么弄？",         # True
-    "那个假怎么找谁批",     # True
-    "报销流程是什么？",     # False
-    "RabbitMQ 用在什么场景？", # False
-    "3天以上的假需要谁审批？", # False
-]
-
-for q in tests:
-    print(f"  {'🗣️' if is_colloquial(q) else '📝'} {q}")
-
-
-# 用户的后续问题依赖上下文，不能独立检索???
+    # 问题在于
+    # httpx.post()
+    # 是同步请求，它会等整个响应全部接收完才返回，所以
+    # iter_lines()
+    # 只是在遍历已经缓冲好的内容 —— 并不是真正的实时流式。
